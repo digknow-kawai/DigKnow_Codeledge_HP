@@ -1,0 +1,86 @@
+name: Deploy theme
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+
+env:
+  SSH_HOST: v2011.coreserver.jp
+  SSH_USER: sjs86huov6g9j
+  THEME_NAME: codeledge.co_v1.7
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name == 'main' && 'production' || 'staging' }}
+    steps:
+      - name: 転送先とビルドの決定
+        run: |
+          case "$GITHUB_REF_NAME" in
+            main)
+              echo "DEST=domains/codeledge.co/public_html/wp-content/themes/${THEME_NAME}/" >> "$GITHUB_ENV"
+              echo "BUILD=build" >> "$GITHUB_ENV"
+              ;;
+            develop)
+              echo "DEST=domains/stg.codeledge.co/public_html/wp-content/themes/${THEME_NAME}/" >> "$GITHUB_ENV"
+              echo "BUILD=build:map" >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "デプロイ対象外のブランチ: $GITHUB_REF_NAME"
+              exit 1
+              ;;
+          esac
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # 取り込んだ直後のテーマは dist をそのまま追跡しており、ビルドの構成を持たない。
+      # src と package.json を足した時点から、digknow.co.jp と同じくここでビルドする
+      - name: ビルド (package.json があるときだけ)
+        run: |
+          if [ -f package.json ]; then
+            npm ci
+            npm run "$BUILD"
+          else
+            echo "::notice::package.json が無いためビルドを飛ばし、theme/ をそのまま転送する"
+          fi
+
+      # 転送は --delete 付きのため、theme/ が空のまま走るとサーバーのテーマが消える。
+      # テーマとして成り立っているかを転送の前に確かめる
+      - name: テーマの検証
+        run: |
+          test -s theme/style.css || { echo "theme/style.css が無い (import-theme を先に実行する)"; exit 1; }
+          test -s theme/functions.php || { echo "theme/functions.php が無い"; exit 1; }
+          test -s theme/dist/css/common.css || { echo "common.css が空"; exit 1; }
+          ls -la theme theme/dist/css theme/dist/js
+
+      - name: SSH 設定
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.CORESERVER_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+
+      - name: rsync
+        run: |
+          echo "::notice::転送先 $GITHUB_REF_NAME:$DEST"
+
+          rsync -avz --delete \
+            --exclude '.gitkeep' \
+            -e "ssh -i ~/.ssh/deploy_key" \
+            ./theme/ "$SSH_USER@$SSH_HOST:$DEST"
+
+      # 届け先を ~/bin にしてはならない。wp-theme-digknow の deploy が ~/bin へ --delete 付きで
+      # 転送しており、そちらが走るたびにこのリポジトリのスクリプトが消される。
+      # 専用の ~/bin-codeledge に置き、crontab からは絶対パスで呼ぶ
+      - name: 運用のスクリプトを転送する
+        if: github.ref_name == 'develop'
+        run: |
+          rsync -avz --delete \
+            -e "ssh -i ~/.ssh/deploy_key" \
+            ./scripts/ "$SSH_USER@$SSH_HOST:bin-codeledge/"

@@ -1,0 +1,37 @@
+name: Preview down
+
+on:
+  pull_request:
+    types:
+      - closed
+
+# SSH クライアントを切っても、インスタンス上で走っているコンテナ操作は残る。
+# 走っている作り直しを取り消すと、次の実行の down -v と競合するため止めない
+concurrency:
+  group: preview-codeledge-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+env:
+  SSH_HOST: 13.192.94.80
+  SSH_USER: ubuntu
+  PR_NUMBER: ${{ github.event.pull_request.number }}
+
+jobs:
+  down:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    # delete_branch_on_merge により merge 後は head ブランチが存在しないため checkout しない。
+    # docker compose -p <プロジェクト名> down -v はコンポーズファイルの無い場所からでも動く
+    steps:
+      - name: SSH 設定
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.PREVIEW_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+
+      - name: スタックを壊す
+        run: ssh -i ~/.ssh/deploy_key "$SSH_USER@$SSH_HOST" "docker compose -p preview-codeledge-pr-${PR_NUMBER} down -v"
+
+      - name: ディレクトリを削除する
+        run: ssh -i ~/.ssh/deploy_key "$SSH_USER@$SSH_HOST" "rm -rf ~/preview/codeledge/pr-${PR_NUMBER}"

@@ -1,0 +1,106 @@
+name: Preview up
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+
+# SSH クライアントを切っても、インスタンス上で走っているコンテナ操作は残る。
+# 走っている作り直しを取り消すと、次の実行の down -v と競合するため止めない
+concurrency:
+  group: preview-codeledge-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+env:
+  SSH_HOST: 13.192.94.80
+  SSH_USER: ubuntu
+  # digknow.co.jp のプレビューと同じインスタンスに相乗りする。
+  # *.preview.digknow.co.jp の A レコードと Traefik をそのまま使えるよう、
+  # ホスト名は codeledge-pr-<番号>.preview.digknow.co.jp とする (ワイルドカードは 1 階層しか覆わない)
+  PREVIEW_DOMAIN: preview.digknow.co.jp
+  PREVIEW_ROOT: preview/codeledge
+  PR_NUMBER: ${{ github.event.pull_request.number }}
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  up:
+    # develop から出す PR は、ステージングと同じコードをステージングの写しの DB で動かすだけになるため立てない
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref != 'develop'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: ビルド (package.json があるときだけ)
+        run: |
+          if [ -f package.json ]; then
+            npm ci
+            npm run build:map
+          else
+            echo "::notice::package.json が無いためビルドを飛ばし、theme/ をそのまま使う"
+          fi
+
+      - name: テーマの検証
+        run: |
+          test -s theme/style.css || { echo "theme/style.css が無い (import-theme を先に実行する)"; exit 1; }
+          test -s theme/functions.php || { echo "theme/functions.php が無い"; exit 1; }
+          ls -la theme
+
+      - name: SSH 設定
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.PREVIEW_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+
+      - name: 既存のスタックを壊す
+        run: ssh -i ~/.ssh/deploy_key "$SSH_USER@$SSH_HOST" "docker compose -p preview-codeledge-pr-${PR_NUMBER} down -v"
+
+      # --delete により前回の .env と htpasswd も消えるが、どちらもこの後の段階で作り直す
+      - name: preview 一式とビルド済みテーマを転送する
+        run: |
+          ssh -i ~/.ssh/deploy_key "$SSH_USER@$SSH_HOST" "mkdir -p ~/${PREVIEW_ROOT}/pr-${PR_NUMBER}"
+          rsync -avz --delete \
+            -e "ssh -i ~/.ssh/deploy_key" \
+            --exclude '.gitkeep' \
+            preview/compose.yml preview/Dockerfile preview/ols preview/scripts theme \
+            "$SSH_USER@$SSH_HOST:~/${PREVIEW_ROOT}/pr-${PR_NUMBER}/"
+
+      - name: .env を生成する
+        run: |
+          DB_PASSWORD="$(openssl rand -hex 20)"
+          DB_ROOT_PASSWORD="$(openssl rand -hex 20)"
+          echo "::add-mask::$DB_PASSWORD"
+          echo "::add-mask::$DB_ROOT_PASSWORD"
+          PREVIEW_HOST="codeledge-pr-${PR_NUMBER}.${PREVIEW_DOMAIN}"
+          PREVIEW_HTPASSWD_PATH="/home/${SSH_USER}/${PREVIEW_ROOT}/pr-${PR_NUMBER}/htpasswd"
+          ENV_CONTENT="$(printf 'DB_HOST=db\nDB_NAME=wordpress\nDB_USER=wordpress\nDB_PASSWORD=%s\nDB_ROOT_PASSWORD=%s\nPREVIEW_HOST=%s\nPREVIEW_HTPASSWD=%s\n' \
+            "$DB_PASSWORD" "$DB_ROOT_PASSWORD" "$PREVIEW_HOST" "$PREVIEW_HTPASSWD_PATH")"
+          echo "$ENV_CONTENT" | ssh -i ~/.ssh/deploy_key "$SSH_USER@$SSH_HOST" "cat > ~/${PREVIEW_ROOT}/pr-${PR_NUMBER}/.env"
+          echo "PREVIEW_HOST=$PREVIEW_HOST" >> "$GITHUB_ENV"
+
+      - name: htpasswd を置く
+        env:
+          PREVIEW_HTPASSWD: ${{ secrets.PREVIEW_HTPASSWD }}
+        run: printf '%s\n' "$PREVIEW_HTPASSWD" | ssh -i ~/.ssh/deploy_key "$SSH_USER@$SSH_HOST" "cat > ~/${PREVIEW_ROOT}/pr-${PR_NUMBER}/htpasswd"
+
+      - name: スタックを起こす
+        run: ssh -i ~/.ssh/deploy_key "$SSH_USER@$SSH_HOST" "cd ~/${PREVIEW_ROOT}/pr-${PR_NUMBER} && export PR_NUMBER=${PR_NUMBER} && docker compose up -d --build"
+
+      - name: ステージングの中身を流し込む
+        run: ssh -i ~/.ssh/deploy_key "$SSH_USER@$SSH_HOST" "cd ~/${PREVIEW_ROOT}/pr-${PR_NUMBER} && ./scripts/seed.sh ${PR_NUMBER} ${PREVIEW_HOST} /home/${SSH_USER}/${PREVIEW_ROOT}/pr-${PR_NUMBER}/theme"
+
+      - name: PR にコメントする
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BODY="$(printf 'プレビュー環境を用意した。\n\n- URL: https://%s/\n- ベーシック認証が必要 (ユーザー名とパスワードは別途共有する)\n' "$PREVIEW_HOST")"
+          gh pr comment "$PR_NUMBER" --edit-last --create-if-none --body "$BODY"

@@ -1,0 +1,45 @@
+# digknow.co.jp のプレビューと同じインスタンス・同じ Traefik に相乗りする。
+# プロジェクト名とルーター名に codeledge を含め、digknow 側の pr-<番号> と衝突させない
+name: preview-codeledge-pr-${PR_NUMBER}
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - db
+    volumes:
+      - ./ols/docker.conf:/usr/local/lsws/conf/templates/docker.conf:ro
+      - ${PREVIEW_HTPASSWD}:/usr/local/lsws/conf/preview-htpasswd:ro
+      - wordpress:/var/www/vhosts/localhost/html
+    networks:
+      - default
+      - preview-proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.codeledge-pr-${PR_NUMBER}.rule=Host(`${PREVIEW_HOST}`)"
+      - "traefik.http.routers.codeledge-pr-${PR_NUMBER}.entrypoints=websecure"
+      - "traefik.http.routers.codeledge-pr-${PR_NUMBER}.tls.certresolver=letsencrypt"
+      - "traefik.http.services.codeledge-pr-${PR_NUMBER}.loadbalancer.server.port=80"
+
+  db:
+    image: mariadb:10.6
+    restart: unless-stopped
+    environment:
+      MARIADB_DATABASE: ${DB_NAME}
+      MARIADB_USER: ${DB_USER}
+      MARIADB_PASSWORD: ${DB_PASSWORD}
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+    volumes:
+      - db_data:/var/lib/mysql
+
+networks:
+  default:
+  preview-proxy:
+    external: true
+
+volumes:
+  wordpress:
+  db_data:

@@ -1,0 +1,100 @@
+name: Preview snapshot
+
+on:
+  schedule:
+    # 06:20 JST (UTC+9) = 21:20 UTC (前日)。コアサーバー側の日次同期 (05:15) より後に置き、
+    # digknow.co.jp のスナップショット (06:00) とは時刻をずらす
+    - cron: '20 21 * * *'
+  workflow_dispatch:
+
+env:
+  SSH_HOST: 13.192.94.80
+  SSH_USER: ubuntu
+  CORESERVER_HOST: v2011.coreserver.jp
+  CORESERVER_USER: sjs86huov6g9j
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: コアサーバーへの SSH を設定する
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.CORESERVER_SSH_KEY }}" > ~/.ssh/coreserver_key
+          chmod 600 ~/.ssh/coreserver_key
+          ssh-keyscan -H "$CORESERVER_HOST" >> ~/.ssh/known_hosts
+          {
+          echo "Host coreserver"
+          echo "  HostName $CORESERVER_HOST"
+          echo "  User $CORESERVER_USER"
+          echo "  IdentityFile ~/.ssh/coreserver_key"
+          } >> ~/.ssh/config
+
+      - name: スナップショットを作る
+        run: preview/scripts/fetch-snapshot.sh "$HOME/preview/codeledge/snapshot"
+
+      - name: インスタンスへの SSH を設定する
+        run: |
+          echo "${{ secrets.PREVIEW_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+
+      - name: スナップショットを一時ディレクトリへ転送する
+        run: |
+          ssh -i ~/.ssh/deploy_key "$SSH_USER@$SSH_HOST" "mkdir -p ~/preview/codeledge"
+          rsync -avz --delete \
+            -e "ssh -i ~/.ssh/deploy_key" \
+            "$HOME/preview/codeledge/snapshot/" \
+            "$SSH_USER@$SSH_HOST:~/preview/codeledge/snapshot.new/"
+
+      # 退避と差し替えを 1 回の接続にまとめる。接続を分けると、その間ずっと
+      # snapshot が存在せず、同時に走る seed.sh から見えなくなる
+      - name: スナップショットを差し替える
+        run: |
+          ssh -i ~/.ssh/deploy_key "$SSH_USER@$SSH_HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          cd "$HOME/preview/codeledge"
+
+          # seed.sh が読み出している間は差し替えない。あちらは同じファイルで共有ロックを取る
+          exec 9>>.snapshot.lock
+          flock 9
+
+          rm -rf snapshot.old
+          if [ -d snapshot ]; then
+            mv snapshot snapshot.old
+          fi
+          if ! mv snapshot.new snapshot; then
+            if [ -d snapshot.old ]; then
+              mv snapshot.old snapshot
+            fi
+            exit 1
+          fi
+          rm -rf snapshot.old
+          REMOTE
+
+      # このワークフローは schedule で動くため、失敗しても画面を見ている人がいない。
+      # issue にすると open のまま残り、直すまで消えない。
+      # 連日失敗したときに同じ issue を積み上げないよう、開いているものがあれば
+      # コメントを足すだけにする
+      - name: 失敗を issue で知らせる
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TITLE: codeledge のステージングのスナップショットの更新が失敗している
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          BODY="$(printf '%s に失敗した。\n\n%s\n\nスナップショットが更新されないため、放置すると PR のプレビューに載る内容が古くなる。\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RUN_URL")"
+          NUMBER="$(gh issue list --state open --limit 100 --json number,title \
+            --jq "map(select(.title == \"$TITLE\")) | first | .number // empty")"
+          if [ -n "$NUMBER" ]; then
+            gh issue comment "$NUMBER" --body "$BODY"
+          else
+            gh issue create --title "$TITLE" --body "$BODY"
+          fi

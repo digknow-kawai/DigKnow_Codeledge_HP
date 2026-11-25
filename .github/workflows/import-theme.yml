@@ -1,0 +1,57 @@
+name: Import theme
+
+# 本番で動いているテーマを、このリポジトリの theme/ へ取り込む。初回の 1 度だけ使う。
+# 取り込んだ結果はブランチ import/theme-from-production へ push するので、
+# そこから develop への PR を作り、中身を確かめてから merge する。
+# コアサーバーへは読み取り (rsync の取得方向) しか行わない
+on:
+  workflow_dispatch:
+
+env:
+  SSH_HOST: v2011.coreserver.jp
+  SSH_USER: sjs86huov6g9j
+  THEME_PATH: domains/codeledge.co/public_html/wp-content/themes/codeledge.co_v1.7
+  BRANCH: import/theme-from-production
+
+permissions:
+  contents: write
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: SSH 設定
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.CORESERVER_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+
+      - name: 本番のテーマの大きさを確かめる
+        run: ssh -i ~/.ssh/deploy_key "$SSH_USER@$SSH_HOST" "du -sh ${THEME_PATH} && du -sh ${THEME_PATH}/* | sort -h | tail -20"
+
+      - name: 本番のテーマを取得する
+        run: |
+          mkdir -p theme
+          rsync -avz --delete \
+            --exclude '.gitkeep' \
+            --exclude 'node_modules/' \
+            --exclude '.DS_Store' \
+            -e "ssh -i ~/.ssh/deploy_key" \
+            "$SSH_USER@$SSH_HOST:${THEME_PATH}/" ./theme/
+
+      - name: ブランチへ commit して push する
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898099+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git add -A theme
+          if git diff --cached --quiet; then
+            echo "::notice::本番のテーマとの差分は無い"
+            exit 0
+          fi
+          git commit -m "chore: 本番の codeledge.co_v1.7 テーマを取り込む"
+          git push -f origin "$BRANCH"
+          echo "::notice::$BRANCH へ push した。develop への PR を作って中身を確かめる"
